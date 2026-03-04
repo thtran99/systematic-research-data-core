@@ -23,8 +23,9 @@ from pipelines.ingestion import IngestionConfig, IngestionPipeline
 
 schema = DatasetSchema(
     name="prices",
-    version="1.0",
+    version="2.0",
     columns=[
+        ColumnSchema(name="symbol", dtype=ColumnType.STRING, nullable=False, description="Ticker symbol"),
         ColumnSchema(name="date",   dtype=ColumnType.STRING, nullable=False, description="Trading date"),
         ColumnSchema(name="close",  dtype=ColumnType.FLOAT,  nullable=False, description="Closing price"),
         ColumnSchema(name="volume", dtype=ColumnType.INT,    nullable=True,  description="Daily volume"),
@@ -37,7 +38,7 @@ schema = DatasetSchema(
 
 config = IngestionConfig(
     dataset_name="prices",
-    version="1.0",
+    version="2.0",
     owner="market-data",
     expected_frequency=DatasetFrequency.DAILY,
     schema=schema,

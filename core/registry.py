@@ -163,6 +163,29 @@ class MetadataRegistry:
             )
             session.commit()
 
+    def get_ingestion_as_of(
+        self, dataset_name: str, as_of: datetime
+    ) -> Optional[IngestionRecord]:
+        """
+        Return the latest ingestion record for dataset_name whose ingested_at
+        is at or before as_of. Enables point-in-time queries: callers get data
+        as it was known at as_of, preventing look-ahead bias.
+        """
+        as_of_naive = as_of.replace(tzinfo=None) if as_of.tzinfo else as_of
+        with self._Session() as session:
+            row = (
+                session.query(IngestionRecordRow)
+                .filter(
+                    IngestionRecordRow.dataset_name == dataset_name,
+                    IngestionRecordRow.ingested_at <= as_of_naive,
+                )
+                .order_by(desc(IngestionRecordRow.ingested_at))
+                .first()
+            )
+            if not row:
+                return None
+            return _to_ingestion_record(row)
+
     def get_ingestion_history(
         self, dataset_name: str, limit: int = 10
     ) -> list[IngestionRecord]:

@@ -26,8 +26,9 @@ from pipelines.ingestion import IngestionConfig, IngestionPipeline
 
 schema = DatasetSchema(
     name="prices",
-    version="1.0",
+    version="2.0",
     columns=[
+        ColumnSchema(name="symbol", dtype=ColumnType.STRING, nullable=False),
         ColumnSchema(name="date",   dtype=ColumnType.STRING, nullable=False),
         ColumnSchema(name="close",  dtype=ColumnType.FLOAT,  nullable=False),
         ColumnSchema(name="volume", dtype=ColumnType.INT,    nullable=True),
@@ -78,9 +79,9 @@ def run_case(label: str, csv_content: str) -> None:
 run_case(
     "Missing column — 'volume' absent from CSV",
     """
-    date,close
-    2026-01-02,100.5
-    2026-01-03,101.2
+    symbol,date,close
+    AAPL,2026-01-02,182.5
+    AAPL,2026-01-03,183.2
     """,
 )
 
@@ -91,10 +92,10 @@ run_case(
 run_case(
     "Unexpected null — 'close' is non-nullable but has an empty value",
     """
-    date,close,volume
-    2026-01-02,100.5,1500000
-    2026-01-03,,1320000
-    2026-01-06,99.8,1780000
+    symbol,date,close,volume
+    AAPL,2026-01-02,182.5,75420000
+    AAPL,2026-01-03,,68130000
+    AAPL,2026-01-06,181.8,82450000
     """,
 )
 
@@ -105,10 +106,10 @@ run_case(
 run_case(
     "Type mismatch — 'close' declared FLOAT but contains text",
     """
-    date,close,volume
-    2026-01-02,100.5,1500000
-    2026-01-03,N/A,1320000
-    2026-01-06,99.8,1780000
+    symbol,date,close,volume
+    AAPL,2026-01-02,182.5,75420000
+    AAPL,2026-01-03,N/A,68130000
+    AAPL,2026-01-06,181.8,82450000
     """,
 )
 

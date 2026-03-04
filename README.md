@@ -38,6 +38,7 @@ External Data Sources (CSV / semi-structured)
 │  /datasets        │    List registered datasets
 │  /health/{name}   │    Latest health report
 │  /metadata/{name} │    Registration + last ingestion
+│  /data/{name}     │    Point-in-time data query (as_of + symbol)
 └───────────────────┘
 ```
 
@@ -86,7 +87,7 @@ systematic-research-data-core/
 │   ├── main.py                  # FastAPI app
 │   ├── dependencies.py          # Registry DI
 │   ├── schemas.py               # Composite response models
-│   └── routes/                  # datasets · health · metadata
+│   └── routes/                  # datasets · health · metadata · data
 │
 ├── tests/
 │   ├── conftest.py
@@ -129,13 +130,35 @@ cd ..
 pytest
 ```
 
+### Run the demo
+
+```bash
+python scripts/demo.py
+```
+
+This ingests the sample multi-asset prices dataset (AAPL, MSFT, GOOGL), runs all health checks, and prints the registry state.
+
 ### Start API server
 
 ```bash
-DATABASE_URL=sqlite:///./metadata.db uvicorn api.main:app --reload
+DATABASE_URL=sqlite:///metadata.db uvicorn api.main:app --reload
 ```
 
 Swagger UI available at `http://localhost:8000/docs`.
+
+```bash
+# List datasets
+curl http://localhost:8000/datasets
+
+# Health report
+curl http://localhost:8000/health/prices
+
+# All symbols as of a date (point-in-time)
+curl "http://localhost:8000/data/prices?as_of=2026-03-04"
+
+# Single symbol
+curl "http://localhost:8000/data/prices?as_of=2026-03-04&symbol=AAPL"
+```
 
 ---
 
@@ -150,6 +173,10 @@ Swagger UI available at `http://localhost:8000/docs`.
 **Layered performance** — The Rust engine handles CSV parsing (rayon parallelism), type normalization, and Parquet writing. Python handles orchestration, metadata, health logic, and the API. If `rust_core` is not installed, the pipeline falls back to a pure Python path transparently.
 
 **Single registry write path** — All metadata writes go through `MetadataRegistry`. Direct table manipulation is not permitted.
+
+**Point-in-time correctness** — `GET /data/{dataset}?as_of=DATE` prevents look-ahead bias at two layers: only ingestions that existed at `as_of` are considered (no revised/adjusted data from future re-ingestions), and only rows with `date <= as_of` are returned (no future price data). Every response includes `ingestion_run_id` and `ingested_at` for a full audit trail.
+
+**Multi-asset** — The canonical schema includes a `symbol` column. All data queries support per-symbol filtering.
 
 ---
 
@@ -173,6 +200,16 @@ Swagger UI available at `http://localhost:8000/docs`.
 | `GET` | `/datasets` | List all registered datasets |
 | `GET` | `/health/{dataset}` | Latest health report for a dataset |
 | `GET` | `/metadata/{dataset}` | Registration + most recent ingestion record |
+| `GET` | `/data/{dataset}?as_of=DATE[&symbol=X]` | Point-in-time data query — returns rows as known at `as_of`, optionally filtered by symbol |
+
+### Point-in-time query
+
+`as_of` is a required `YYYY-MM-DD` date. The endpoint enforces two layers of look-ahead bias prevention:
+
+1. **Ingestion selection** — only ingestions whose `ingested_at ≤ as_of` are considered. Data re-ingested after `as_of` (e.g. adjusted prices) is invisible.
+2. **Row filter** — only rows with `date ≤ as_of` are returned. No future price data leaks into the result.
+
+The response includes `ingestion_run_id` and `ingested_at` so callers can audit exactly which ingestion was used.
 
 ---
 

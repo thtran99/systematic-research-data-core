@@ -6,6 +6,11 @@ End-to-end ingestion orchestrator for the systematic research data platform.
 Wires together: CSV loading → schema validation → Parquet storage →
 metadata registry → health reporting.
 
+Performance layer: when rust_core is installed, CSV parsing, type normalization,
+Parquet writing, and checksum computation are delegated to the Rust engine.
+If rust_core is not available, the pipeline falls back to the pure Python path
+transparently — no change in behaviour or output contract.
+
 Design principles:
 - Idempotent: re-running with the same inputs produces the same state.
 - Deterministic: run_id is derived from inputs, not a random UUID.
@@ -16,7 +21,7 @@ Design principles:
 
 import hashlib
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -32,7 +37,14 @@ from core.models import (
     IngestionRecord,
 )
 from core.registry import MetadataRegistry
-from core.validation.schema_validator import SchemaValidator, SchemaViolationError
+from core.validation.schema_validator import SchemaValidator
+
+try:
+    import rust_core as _rust_core
+    _RUST_AVAILABLE = True
+except ImportError:
+    _rust_core = None  # type: ignore[assignment]
+    _RUST_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -109,14 +121,12 @@ class IngestionPipeline:
         Execute the full ingestion pipeline.
 
         Steps:
-        1. Load CSV into DataFrame.
-        2. Validate schema (gate — no storage on failure).
-        3. Compute deterministic run_id and partition path.
-        4. Write Parquet and compute file checksum.
-        5. Upsert dataset registration in registry.
-        6. Record ingestion (idempotent on run_id).
-        7. Run health checks and persist report.
-        8. Return IngestionResult.
+        1. Parse CSV, normalize types, write Parquet, compute checksum.
+           → Rust engine (rust_core) when available, Python fallback otherwise.
+        2. Upsert dataset registration in registry.
+        3. Record ingestion (idempotent on run_id).
+        4. Run health checks on the written Parquet and persist report.
+        5. Return IngestionResult.
         """
         cfg = self._config
         schema_hash = cfg.schema.compute_hash()
@@ -126,75 +136,63 @@ class IngestionPipeline:
             Path(cfg.parquet_base) / cfg.dataset_name / str(partition_date) / "data.parquet"
         )
 
-        logger.info("Starting ingestion run_id=%s dataset=%s", run_id, cfg.dataset_name)
+        logger.info(
+            "Starting ingestion run_id=%s dataset=%s engine=%s",
+            run_id, cfg.dataset_name, "rust" if _RUST_AVAILABLE else "python",
+        )
 
-        # Step 1 — Load
-        df = pd.read_csv(cfg.source_path)
-        logger.debug("Loaded %d rows from %s", len(df), cfg.source_path)
-
-        # Step 2 — Validate (gate)
-        validator = SchemaValidator(strict_columns=cfg.strict_columns)
-        result = validator.validate(df, cfg.schema)
-        if not result.valid:
-            error_summary = "; ".join(
-                f"[{e.error_type}] {e.column}: {e.details}" for e in result.errors
-            )
-            logger.warning("Schema validation failed for %s: %s", cfg.dataset_name, error_summary)
+        # Step 1 — Parse + write Parquet (Rust or Python)
+        ingest_result = _ingest(cfg, partition_path, schema_hash)
+        if not ingest_result["success"]:
             return IngestionResult(
                 success=False,
                 run_id=run_id,
                 dataset_name=cfg.dataset_name,
-                row_count=len(df),
+                row_count=ingest_result.get("row_count", 0),
                 partition_path=partition_path,
                 schema_hash=schema_hash,
-                error=f"Schema validation failed ({len(result.errors)} error(s)): {error_summary}",
+                error=ingest_result["error"],
             )
 
-        # Step 3 — Write Parquet
-        _write_parquet(df, partition_path)
-        logger.debug("Wrote Parquet to %s", partition_path)
+        row_count: int = ingest_result["row_count"]
+        checksum: str = ingest_result["checksum"]
 
-        # Step 4 — Checksum of written file
-        checksum = _sha256_file(partition_path)
-
-        # Step 5 — Register dataset (upsert)
-        registration = DatasetRegistration(
+        # Step 2 — Register dataset (upsert)
+        self._registry.register_dataset(DatasetRegistration(
             name=cfg.dataset_name,
             version=cfg.version,
             owner=cfg.owner,
             expected_frequency=cfg.expected_frequency,
             schema_hash=schema_hash,
-        )
-        self._registry.register_dataset(registration)
+        ))
 
-        # Step 6 — Record ingestion (idempotent)
-        record = IngestionRecord(
+        # Step 3 — Record ingestion (idempotent on run_id)
+        self._registry.record_ingestion(IngestionRecord(
             run_id=run_id,
             dataset_name=cfg.dataset_name,
             version=cfg.version,
             ingested_at=datetime.now(tz=timezone.utc),
-            row_count=len(df),
+            row_count=row_count,
             checksum=checksum,
             source_path=cfg.source_path,
             partition_path=partition_path,
             schema_hash=schema_hash,
-        )
-        self._registry.record_ingestion(record)
+        ))
 
-        # Step 7 — Health check
+        # Step 4 — Health check on the written Parquet (canonical data, not raw CSV)
+        df = pd.read_parquet(partition_path)
         reporter = HealthReporter(self._registry, nullable_threshold=cfg.nullable_threshold)
         health_report = reporter.run(cfg.dataset_name, df, cfg.schema)
         logger.info(
             "Health check complete dataset=%s status=%s",
-            cfg.dataset_name,
-            health_report.status.value,
+            cfg.dataset_name, health_report.status.value,
         )
 
         return IngestionResult(
             success=True,
             run_id=run_id,
             dataset_name=cfg.dataset_name,
-            row_count=len(df),
+            row_count=row_count,
             partition_path=partition_path,
             schema_hash=schema_hash,
             health_report=health_report,
@@ -204,6 +202,62 @@ class IngestionPipeline:
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
+
+
+def _ingest(cfg: "IngestionConfig", partition_path: str, schema_hash: str) -> dict:
+    """
+    Parse CSV, normalize types, write Parquet, compute checksum.
+
+    Returns a dict with keys:
+      success (bool), row_count (int), checksum (str), error (str|None)
+
+    Delegates to the Rust engine when available; falls back to Python otherwise.
+    """
+    if _RUST_AVAILABLE:
+        return _ingest_rust(cfg, partition_path)
+    return _ingest_python(cfg, partition_path)
+
+
+def _ingest_rust(cfg: "IngestionConfig", partition_path: str) -> dict:
+    """Rust path: parse + normalize + write via rust_core.ingest()."""
+    try:
+        result = _rust_core.ingest(
+            source_path=cfg.source_path,
+            schema_json=cfg.schema.model_dump_json(),
+            output_path=partition_path,
+        )
+        return {
+            "success": True,
+            "row_count": result.row_count,
+            "checksum": result.checksum,
+            "error": None,
+        }
+    except ValueError as exc:
+        return {"success": False, "row_count": 0, "checksum": "", "error": str(exc)}
+
+
+def _ingest_python(cfg: "IngestionConfig", partition_path: str) -> dict:
+    """Python fallback: pandas read_csv + SchemaValidator + to_parquet."""
+    df = pd.read_csv(cfg.source_path)
+    logger.debug("Loaded %d rows from %s (Python path)", len(df), cfg.source_path)
+
+    validator = SchemaValidator(strict_columns=cfg.strict_columns)
+    validation = validator.validate(df, cfg.schema)
+    if not validation.valid:
+        error_summary = "; ".join(
+            f"[{e.error_type}] {e.column}: {e.details}" for e in validation.errors
+        )
+        logger.warning("Schema validation failed for %s: %s", cfg.dataset_name, error_summary)
+        return {
+            "success": False,
+            "row_count": len(df),
+            "checksum": "",
+            "error": f"Schema validation failed ({len(validation.errors)} error(s)): {error_summary}",
+        }
+
+    _write_parquet(df, partition_path)
+    checksum = _sha256_file(partition_path)
+    return {"success": True, "row_count": len(df), "checksum": checksum, "error": None}
 
 
 def _compute_run_id(

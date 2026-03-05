@@ -7,3 +7,4 @@ data/*.db
 *.db
 .env
 target/
+PROJECT_GUIDE.md
